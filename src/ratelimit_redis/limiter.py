@@ -1,13 +1,10 @@
-"""Token-bucket rate limiter backed by a Redis Lua script."""
+"""Token-bucket rate limiter backed by Redis (pipelined GET/SET form)."""
 from __future__ import annotations
 
-from importlib import resources
+import time
 from typing import Tuple
 
 import redis
-
-
-_SCRIPT = resources.files("ratelimit_redis").joinpath("bucket.lua").read_text()
 
 
 class Limiter:
@@ -15,18 +12,28 @@ class Limiter:
         self._r = redis.Redis.from_url(redis_url, decode_responses=False)
         self._capacity = capacity
         self._refill = refill_per_sec
-        self._sha = self._r.script_load(_SCRIPT)
 
     def check(self, key: str, cost: int = 1) -> Tuple[bool, int]:
-        bucket_key = f"rl:{{{key}}}"  # hash-tag for cluster compatibility
-        result = self._r.evalsha(
-            self._sha,
-            1,
-            bucket_key,
-            str(self._capacity),
-            str(self._refill),
-            str(cost),
-        )
-        allowed = bool(result[0])
-        remaining = int(result[1])
-        return allowed, remaining
+        bucket_key = f"rl:{{{key}}}"
+        pipe = self._r.pipeline()
+        pipe.hmget(bucket_key, "tokens", "ts")
+        pipe.time()
+        state, now = pipe.execute()
+        now_ms = int(now[0]) * 1000 + int(now[1]) // 1000
+        if state[0] is None:
+            tokens = float(self._capacity)
+            last_ts = now_ms
+        else:
+            tokens = float(state[0]); last_ts = int(state[1])
+        elapsed = max(0.0, (now_ms - last_ts) / 1000.0)
+        tokens = min(self._capacity, tokens + elapsed * self._refill)
+        allowed = False
+        if tokens >= cost:
+            tokens -= cost
+            allowed = True
+        ttl = max(60, int(self._capacity / self._refill * 10))
+        pipe = self._r.pipeline()
+        pipe.hmset(bucket_key, {"tokens": str(tokens), "ts": str(now_ms)})
+        pipe.expire(bucket_key, ttl)
+        pipe.execute()
+        return allowed, int(tokens)
